@@ -6,7 +6,7 @@ authors = [
     {name = "Your Name",email = "you@example.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.10,<4.0"
 dependencies = [
     "minio (>=7.2.15,<8.0.0)",
     "dataclasses-json (>=0.6.7,<0.7.0)",
