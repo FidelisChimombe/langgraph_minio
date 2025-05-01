@@ -1,0 +1,45 @@
+config:
+  target: "http://localhost:8000"
+  phases:
+    - duration: 10   # seconds
+      arrivalRate: 1 # RPS
+  processor: "./dynamic-data.js"  # for dynamic data
+  defaults:
+    headers:
+      Content-Type: "application/json"
+
+scenarios:
+  - name: "Stress test all endpoints"
+    flow:
+      - function: "generateCheckpoint"
+      - post:
+          url: "/save-checkpoint"
+          json: "{{ checkpoint }}"
+      - get:
+          url: "/load-checkpoint/{{ checkpoint_id }}"
+      - function: "generateKeyValue"
+      - post:
+          url: "/store"
+          json: "{{ item }}"
+      - get:
+          url: "/store/{{ item.key }}"
+      - post:
+          url: "/async-store"
+          json: "{{ item }}"
+      - get:
+          url: "/async-store/{{ item.key }}"
+      - post:
+          url: "/store-5kb"
+          json:
+            key: "large_file_5kb_{{ item.key }}"
+      - get:
+          url: "/large-file/large_file_5kb_{{ item.key }}"
+      - post:
+          url: "/store-10kb"
+          json:
+            key: "large_file_10kb_{{ item.key }}"
+      - get:
+          url: "/large-file/large_file_10kb_{{ item.key }}"
+      - get:
+          url: "/list-large-files"
+          

@@ -1,0 +1,15 @@
+{
+  "name": "artillery",
+  "version": "1.0.0",
+  "main": "dynamic-data.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "uuid": "^11.1.0"
+  }
+}
