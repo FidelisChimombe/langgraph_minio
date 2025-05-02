@@ -1,7 +1,7 @@
 import pytest
 from datetime import datetime, timezone, UTC
 from minio import Minio
-from langgraph_minio.checkpoint.base import BaseMinioSaver, Checkpoint, CheckpointMetadata
+from langgraph_minio.checkpoint.base import MinioSaver, Checkpoint, CheckpointMetadata
 from langgraph_minio.store.base import MinioStore
 import logging
 from typing import Dict, Any, Optional, List, Tuple
@@ -43,8 +43,8 @@ def store(minio_client):
 
 @pytest.fixture
 def checkpointer(store):
-    """Create a BaseMinioSaver fixture."""
-    return BaseMinioSaver(store)
+    """Create a MinioSaver fixture."""
+    return MinioSaver(store)
 
 @pytest.fixture
 def sample_data() -> Dict[str, Any]:
@@ -283,7 +283,7 @@ def test_error_handling(checkpointer):
     """Test error handling."""
     # Test with invalid store
     with pytest.raises(ValueError):
-        BaseMinioSaver(None)
+        MinioSaver(None)
     
     # Test with invalid bucket
     with pytest.raises(RuntimeError):

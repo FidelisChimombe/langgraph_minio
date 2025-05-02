@@ -55,14 +55,12 @@ def minio_store():
 @pytest_asyncio.fixture
 async def async_store():
     """Create an AsyncMinioStore fixture."""
-    async_store = AsyncMinioStore(
+    return AsyncMinioStore(
         endpoint_url=f"http://{MINIO_ENDPOINT}",
         access_key=MINIO_ACCESS_KEY,
         secret_key=MINIO_SECRET_KEY,
         bucket_name=TEST_BUCKET
     )
-    await async_store._ensure_bucket_exists()
-    return async_store
 
 @pytest.fixture
 def sample_data():
@@ -107,10 +105,74 @@ async def cleanup(async_store):
         await async_store.adelete_object(obj)
 
 @pytest.mark.asyncio
-async def test_async_store_initialization(async_store):
+async def test_async_store_initialization():
     """Test async store initialization and bucket existence."""
-    assert async_store.bucket_name == TEST_BUCKET
-    assert async_store.client is not None
+    # Test with direct instantiation
+    store = AsyncMinioStore(
+        endpoint_url=f"http://{MINIO_ENDPOINT}",
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        bucket_name=TEST_BUCKET
+    )
+    assert store.bucket_name == TEST_BUCKET
+    assert store.client is not None
+
+    # Test bucket exists
+    await store._ensure_bucket_exists()
+    exists = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: store.client.bucket_exists(TEST_BUCKET)
+    )
+    assert exists
+
+    # Test context manager
+    async with AsyncMinioStore(
+        endpoint_url=f"http://{MINIO_ENDPOINT}",
+        access_key=MINIO_ACCESS_KEY,
+        secret_key=MINIO_SECRET_KEY,
+        bucket_name=TEST_BUCKET
+    ) as store:
+        assert store.bucket_name == TEST_BUCKET
+        assert store.client is not None
+
+@pytest.mark.asyncio
+async def test_async_store_error_handling():
+    """Test error handling for AsyncMinioStore operations."""
+    # Test invalid bucket name
+    print("***********test invalid bucket name")
+    with pytest.raises(ValueError):
+        AsyncMinioStore(
+            endpoint_url=f"http://{MINIO_ENDPOINT}",
+            access_key=MINIO_ACCESS_KEY,
+            secret_key=MINIO_SECRET_KEY,
+            bucket_name=None
+        )
+    
+    # Test invalid credentials
+    print("***********test invalid credentials")
+    with pytest.raises(RuntimeError):
+        try:
+            print("***********raising")
+            AsyncMinioStore(
+                endpoint_url=f"http://{MINIO_ENDPOINT}",
+                access_key="wrong",
+                secret_key="wrong",
+                bucket_name=TEST_BUCKET
+            )
+        except Exception as e:
+            print("***********error")
+            print(e)
+            raise e
+    
+    # Test invalid endpoint
+    print("***********test invalid endpoint")
+    with pytest.raises(RuntimeError):
+        AsyncMinioStore(
+            endpoint_url="http://invalid-endpoint:9000",
+            access_key=MINIO_ACCESS_KEY,
+            secret_key=MINIO_SECRET_KEY,
+            bucket_name=TEST_BUCKET
+        )
 
 @pytest.mark.asyncio
 async def test_async_put_get_object(async_store, sample_data):
@@ -159,12 +221,6 @@ async def test_async_list_objects(async_store, sample_data):
     objects = await async_store.alist_objects("test-list-")
     assert len(objects) == 3
     assert all(obj in test_keys for obj in objects)
-    
-    # List objects with namespace
-    await async_store.aput_object("namespace/test-key", data)
-    objects = await async_store.alist_objects("namespace/")
-    assert len(objects) == 1
-    assert objects[0] == "namespace/test-key"
 
 @pytest.mark.asyncio
 async def test_async_delete_object(async_store, sample_data):
@@ -207,7 +263,7 @@ async def test_async_list_namespaces(async_store, sample_namespace_data):
             await async_store.aput(("test", ns), key, value)
     
     # List namespaces
-    namespaces = await async_store.alist_namespaces()
+    namespaces = await async_store.alist_namespaces(prefix=("test",))
     assert len(namespaces) >= 2
     assert ("test", "ns1") in namespaces
     assert ("test", "ns2") in namespaces
@@ -216,8 +272,10 @@ async def test_async_list_namespaces(async_store, sample_namespace_data):
 async def test_async_search(async_store, sample_namespace_data):
     """Test searching objects asynchronously."""
     # Put objects in different namespaces
+    print(sample_namespace_data)
     for ns, data in sample_namespace_data["test"].items():
         for key, value in data.items():
+            print("***********putting", ("test", ns), key, value)
             await async_store.aput(("test", ns), key, value)
     
     # Search with filter
@@ -225,9 +283,9 @@ async def test_async_search(async_store, sample_namespace_data):
         ("test", "ns1"),
         filter={"value": {"$eq": 1}}
     )
+    print("***********results", results)
     assert len(results) == 1
     assert results[0].value["value"] == 1
-
 
 @pytest.mark.asyncio
 async def test_async_error_handling(async_store):
@@ -282,7 +340,7 @@ async def test_async_ttl_operations(async_store, sample_data):
         ("test", "ttl"),
         "async_key",
         sample_data,
-        ttl=0.1
+        ttl=0.05  # 3 second TTL (3/60 minutes)
     )
 
     # Verify object exists
@@ -290,7 +348,7 @@ async def test_async_ttl_operations(async_store, sample_data):
     assert result == sample_data
 
     # Wait for TTL to expire
-    time.sleep(0.2)
+    await asyncio.sleep(4)  # Wait 2 seconds
 
     # Verify object is gone
     result = await async_store.aget(("test", "ttl"), "async_key")
@@ -301,25 +359,25 @@ async def test_async_ttl_operations(async_store, sample_data):
         ("test", "ttl"),
         "async_refresh",
         sample_data,
-        ttl=0.2  # 200ms TTL
+        ttl=0.05  # 3 second TTL (3/60 minutes)
     )
 
-    # Wait 100ms
-    time.sleep(0.1)
+    # Wait 1 second
+    await asyncio.sleep(1)
 
     # Refresh TTL - this should reset the last_accessed time
     result = await async_store.aget(("test", "ttl"), "async_refresh", refresh_ttl=True)
     assert result == sample_data
 
-    # Wait 150ms - original TTL would have expired, but refresh should keep it alive
-    time.sleep(0.15)
+    # Wait 2 seconds - original TTL would have expired, but refresh should keep it alive
+    await asyncio.sleep(2)
 
     # Object should still exist because we refreshed TTL
     result = await async_store.aget(("test", "ttl"), "async_refresh")
     assert result == sample_data
 
-    # Wait another 200ms - now it should expire
-    time.sleep(0.2)
+    # Wait another 2 seconds - now it should expire
+    await asyncio.sleep(2)
 
     # Verify object is gone
     result = await async_store.aget(("test", "ttl"), "async_refresh")

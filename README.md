@@ -25,7 +25,7 @@ poetry install
 
 ```python
 from langgraph_minio.store.base import MinioStore
-from langgraph_minio.checkpoint.base import BaseMinioSaver
+from langgraph_minio.checkpoint.base import MinioSaver
 from langgraph.checkpoint.base import Checkpoint
 
 # Initialize the store
@@ -37,7 +37,7 @@ store = MinioStore(
 )
 
 # Initialize the checkpoint saver
-saver = BaseMinioSaver(store)
+saver = MinioSaver(store)
 
 # Create a checkpoint with channel values and versions
 checkpoint = Checkpoint(

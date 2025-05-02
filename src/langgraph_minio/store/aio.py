@@ -1,6 +1,3 @@
-import pickle
-import json
-from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, Optional, List, Tuple, Union, Iterable
 import logging
 import asyncio
@@ -8,53 +5,52 @@ from functools import partial
 import aiohttp
 from langgraph.store.base import (
     SearchItem,
-    GetOp,
-    PutOp,
-    SearchOp,
-    ListNamespacesOp,
     Op,
     Result
 )
 from .base import MinioStore
 from minio.error import S3Error
 from minio import Minio
+import json
+from datetime import datetime, timezone
+import io
+import threading
+import time
+from collections import defaultdict
+import pickle
 
 logger = logging.getLogger(__name__)
 
 class AsyncMinioStore(MinioStore):
     """Async wrapper around MinioStore."""
 
-    def __init__(self, *args, **kwargs):
-        """Initialize the async store without calling ensure_bucket_exists."""
-        # Skip _ensure_bucket_exists in parent class
-        self.client = None
-        self.bucket_name = None
-        
-        # Get the endpoint_url, access_key, secret_key from args or kwargs
-        if args:
-            endpoint_url = args[0]
-            access_key = args[1] if len(args) > 1 else kwargs.get('access_key')
-            secret_key = args[2] if len(args) > 2 else kwargs.get('secret_key')
-            bucket_name = args[3] if len(args) > 3 else kwargs.get('bucket_name')
-            client = args[4] if len(args) > 4 else kwargs.get('client')
-        else:
-            endpoint_url = kwargs.get('endpoint_url')
-            access_key = kwargs.get('access_key')
-            secret_key = kwargs.get('secret_key')
-            bucket_name = kwargs.get('bucket_name')
-            client = kwargs.get('client')
-
-        if not client and not (endpoint_url and access_key and secret_key):
-            raise ValueError("Either client or endpoint_url, access_key, and secret_key must be provided")
-        
-        self.client = client or Minio(
-            endpoint_url.replace("http://", "").replace("https://", ""),
-            access_key=access_key,
-            secret_key=secret_key,
-            secure=False
-        )
-        self.bucket_name = bucket_name or "default"
-
+    def __init__(self, endpoint_url=None, access_key=None, secret_key=None, bucket_name=None, client=None):
+        """Initialize the async store."""
+        if not bucket_name:
+            raise ValueError("bucket_name is required")
+            
+        try:
+            if client:
+                super().__init__(bucket_name=bucket_name, client=client)
+            else:
+                if not endpoint_url:
+                    raise ValueError("endpoint_url is required")
+                if not access_key:
+                    raise ValueError("access_key is required") 
+                if not secret_key:
+                    raise ValueError("secret_key is required")
+                    
+                super().__init__(endpoint_url=endpoint_url, access_key=access_key, 
+                               secret_key=secret_key, bucket_name=bucket_name)
+                
+            # Test connection by checking bucket exists
+            self.client.bucket_exists(bucket_name)
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize MinIO client: {str(e)}")
+            
+        self.loop = asyncio.get_event_loop()
+            
     async def __aenter__(self):
         """Async context manager entry."""
         await self._ensure_bucket_exists()
@@ -64,155 +60,82 @@ class AsyncMinioStore(MinioStore):
         """Async context manager exit."""
         pass
 
-    async def _ensure_bucket_exists(self) -> None:
+    async def _ensure_bucket_exists(self):
         """Ensure the bucket exists."""
         try:
-            loop = asyncio.get_event_loop()
-            exists = await loop.run_in_executor(None, self.client.bucket_exists, self.bucket_name)
+            exists = await self.loop.run_in_executor(
+                None,
+                self.client.bucket_exists,
+                self.bucket_name
+            )
             if not exists:
-                await loop.run_in_executor(None, self.client.make_bucket, self.bucket_name)
-                logger.debug(f"Created bucket {self.bucket_name}")
-            else:
-                logger.debug(f"Bucket {self.bucket_name} already exists")
+                await self.loop.run_in_executor(
+                    None,
+                    self.client.make_bucket,
+                    self.bucket_name
+                )
         except Exception as e:
-            logger.error(f"Failed to ensure bucket exists: {e}")
-            raise RuntimeError(f"Failed to ensure bucket exists: {e}")
+            raise RuntimeError(f"Failed to ensure bucket exists: {str(e)}")
 
     async def alist_objects(self, prefix: str = "") -> List[str]:
-        """Async version of list_objects."""
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.list_objects, prefix)
-        except Exception as e:
-            logger.error(f"Failed to list objects: {e}")
-            raise RuntimeError(f"Failed to list objects: {e}")
+        """Async wrapper around list_objects."""
+        await self._ensure_bucket_exists()
+        return await self.loop.run_in_executor(None, super().list_objects, prefix)
 
-    async def aget_object(self, key: str, include_metadata: bool = False, refresh_ttl: bool = False) -> Optional[Union[bytes, Tuple[bytes, Dict[str, str]]]]:
-        """Async version of get_object."""
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.get_object, key, include_metadata, refresh_ttl)
-        except Exception as e:
-            logger.error(f"Failed to get object: {e}")
-            raise
+    async def aget_object(self, key: str, include_metadata: bool = False, refresh_ttl: bool = False) -> Union[Optional[bytes], Optional[Tuple[bytes, Dict[str, str]]]]:
+        """Async wrapper around get_object."""
+        await self._ensure_bucket_exists()
+        return await self.loop.run_in_executor(None, super().get_object, key, include_metadata, refresh_ttl)
 
     async def aput_object(self, key: str, data: bytes, metadata: Optional[Dict[str, str]] = None) -> None:
-        """Async version of put_object."""
-        try:
-            loop = asyncio.get_event_loop()
-            func = partial(self.put_object, key, data, metadata=metadata)
-            await loop.run_in_executor(None, func)
-        except Exception as e:
-            logger.error(f"Failed to put object: {e}")
-            raise
+        """Async wrapper around put_object."""
+        await self._ensure_bucket_exists()
+        await self.loop.run_in_executor(None, super().put_object, key, data, metadata)
 
     async def adelete_object(self, key: str) -> None:
-        """Async version of delete_object."""
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.delete_object, key)
-        except Exception as e:
-            logger.error(f"Failed to delete object: {e}")
-            raise
+        """Async wrapper around delete_object."""
+        await self._ensure_bucket_exists()
+        await self.loop.run_in_executor(None, super().delete_object, key)
 
-    async def aget(
-        self,
-        namespace: Tuple[str, ...],
-        key: str,
-        *,
-        refresh_ttl: Optional[bool] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Async version of get."""
-        try:
-            loop = asyncio.get_event_loop()
-            func = partial(self.get, namespace, key, refresh_ttl=refresh_ttl)
-            return await loop.run_in_executor(None, func)
-        except Exception as e:
-            logger.error(f"Failed to get item: {e}")
-            raise
+    async def aget(self, namespace, key, refresh_ttl=False):
+        """Get an object asynchronously."""
+        await self._ensure_bucket_exists()
+        return await self.loop.run_in_executor(
+            None,
+            lambda: self.get(namespace, key, refresh_ttl=refresh_ttl)
+        )
 
-    async def aput(
-        self,
-        namespace: Tuple[str, ...],
-        key: str,
-        data: Dict[str, Any],
-        *,
-        ttl: Optional[float] = None
-    ) -> None:
-        """Async version of put."""
-        try:
-            loop = asyncio.get_event_loop()
-            func = partial(self.put, namespace, key, data, ttl=ttl)
-            await loop.run_in_executor(None, func)
-        except Exception as e:
-            logger.error(f"Failed to put item: {e}")
-            raise
+    async def aput(self, namespace, key, data, ttl=None):
+        print("***********putting --xxx", namespace, key, data, ttl)
+        """Put an object asynchronously."""
+        await self._ensure_bucket_exists()
+        await self.loop.run_in_executor(
+            None,
+            lambda: self.put(namespace, key, data, ttl=ttl)
+        )
 
     async def adelete(self, namespace: Tuple[str, ...], key: str) -> None:
-        """Async version of delete."""
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self.delete, namespace, key)
-        except Exception as e:
-            logger.error(f"Failed to delete item: {e}")
-            raise
+        """Async wrapper around delete."""
+        await self._ensure_bucket_exists()
+        await self.loop.run_in_executor(None, super().delete, namespace, key)
 
-    async def asearch(
-        self,
-        namespace_prefix: Tuple[str, ...],
-        *,
-        query: Optional[str] = None,
-        filter: Optional[Dict[str, Any]] = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None,
-        refresh_ttl: Optional[bool] = None
-    ) -> List[SearchItem]:
-        """Async version of search."""
-        try:
-            loop = asyncio.get_event_loop()
-            func = partial(
-                self.search,
-                namespace_prefix,
-                query=query,
-                filter=filter,
-                limit=limit,
-                offset=offset,
-                refresh_ttl=refresh_ttl
-            )
-            return await loop.run_in_executor(None, func)
-        except Exception as e:
-            logger.error(f"Failed to search: {e}")
-            raise
+    async def asearch(self, namespace_prefix, query=None, filter=None, limit=None, offset=None):
+        """Search for objects asynchronously."""
+        await self._ensure_bucket_exists()
+        return await self.loop.run_in_executor(
+            None,
+            lambda: self.search(namespace_prefix, query=query, filter=filter, limit=limit, offset=offset)
+        )
 
-    async def alist_namespaces(
-        self,
-        prefix: Tuple[str, ...] = (),
-        *,
-        max_depth: Optional[int] = None,
-        limit: Optional[int] = None,
-        offset: Optional[int] = None
-    ) -> List[str]:
-        """Async version of list_namespaces."""
-        try:
-            loop = asyncio.get_event_loop()
-            func = partial(
-                self.list_namespaces,
-                max_depth=max_depth,
-                limit=limit,
-                offset=offset
-            )
-            if prefix:
-                func = partial(func, prefix=prefix)
-            return await loop.run_in_executor(None, func)
-        except Exception as e:
-            logger.error(f"Failed to list namespaces: {e}")
-            raise
+    async def alist_namespaces(self, prefix=None, max_depth=None, limit=100, offset=0):
+        """List namespaces asynchronously."""
+        await self._ensure_bucket_exists()
+        return await self.loop.run_in_executor(
+            None,
+            lambda: self.list_namespaces(prefix=prefix, max_depth=max_depth, limit=limit, offset=offset)
+        )
 
     async def abatch(self, ops: Iterable[Op]) -> List[Result]:
-        """Async version of batch."""
-        try:
-            loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(None, self.batch, ops)
-        except Exception as e:
-            logger.error(f"Failed to execute batch operations: {e}")
-            raise
+        """Async wrapper around batch."""
+        await self._ensure_bucket_exists()
+        return await self.loop.run_in_executor(None, super().batch, ops)

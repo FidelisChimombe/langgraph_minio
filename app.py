@@ -5,13 +5,19 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.base import RunnableConfig
 from typing import Dict, TypedDict, Any, List, Callable
 
+
+
 from typing import Annotated
 from langgraph.graph import StateGraph, END
 from operator import add
 from langgraph_minio.store.aio import AsyncMinioStore
 from langgraph_minio.store.base import MinioStore
-from langgraph_minio.checkpoint.base import BaseMinioSaver
+from langgraph_minio.checkpoint.base import MinioSaver
+from langgraph_minio.checkpoint.aio import AsyncMinioSaver
+
 from minio import Minio
+
+
 
 
 from pydantic import BaseModel
@@ -40,17 +46,19 @@ store = MinioStore(
 )
 
 async_store = AsyncMinioStore(
-    bucket_name="pro-sci-kit-test",
-    client=Minio(
-        "localhost:9000",
-        access_key="minioadmin",
-        secret_key="minioadmin",
-        secure=False
-    )
+    bucket_name="pro-sci-kit-test-async",
+    endpoint_url="http://localhost:9000",
+    access_key="minioadmin",
+    secret_key="minioadmin",
 )
-saver = BaseMinioSaver(
+saver = MinioSaver(
     store=store,
 )
+
+saver = AsyncMinioSaver(
+    store=async_store,
+)
+
 
 class CheckpointData(BaseModel):
     checkpoint_id: str

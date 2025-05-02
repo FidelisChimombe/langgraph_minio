@@ -1,7 +1,6 @@
 from typing import Dict, Any, List, Optional, Tuple, cast, TypedDict, Sequence, Iterator, Union, TypeVar, Generic
 from typing_extensions import TypeAlias
 import json
-from botocore.exceptions import ClientError
 from langchain_core.runnables import RunnableConfig
 from langgraph_minio.store.base import MinioStore
 from langgraph.checkpoint.base import BaseCheckpointSaver, CheckpointTuple
@@ -213,19 +212,43 @@ class Serde:
         else:
             return ("json", json.dumps(value))
 
-class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
-    """A checkpoint saver that uses MinIO as the backend storage."""
+class MinioSaver(BaseCheckpointSaver, Generic[StoreType]):
+    """A high-performance checkpoint saver that uses MinIO as the backend storage."""
     
     EMPTY_ID_SENTINEL = "empty"
     
-    def __init__(self, store: StoreType):
-        """Initialize the checkpoint saver."""
+    def __init__(
+        self,
+        store: StoreType,
+        cache_size: int = 10000,
+        cache_ttl: float = 5.0,
+        buffer_size: int = 1000,
+        buffer_interval: float = 1.0,
+    ):
+        """Initialize the checkpoint saver.
+        
+        Args:
+            store: The MinIO store to use
+            cache_size: Maximum number of items to cache (default: 10000)
+            cache_ttl: Time-to-live for cached items in seconds (default: 5.0)
+            buffer_size: Maximum number of writes to buffer (default: 1000)
+            buffer_interval: Interval between buffer flushes in seconds (default: 1.0)
+        """
         if store is None:
             raise ValueError("Store cannot be None")
-            
+        
+        
         self.store = store
         self.serde = Serde()
         self.prefix = "checkpoints"  # Set the prefix here
+        
+        # Configure store with optimized settings if available
+        if hasattr(store, 'cache'):
+            store.cache.max_size = cache_size
+            store.cache.ttl = cache_ttl
+        if hasattr(store, 'write_buffer'):
+            store.write_buffer.max_size = buffer_size
+            store.write_buffer.flush_interval = buffer_interval
 
     def _get_key(self, thread_id: str, checkpoint_id: str, checkpoint_ns: str = "") -> str:
         """Get the key for a checkpoint."""
@@ -370,8 +393,6 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
 
     def put(self, config: RunnableConfig, checkpoint: Any, metadata: Optional[Dict[str, Any]] = None, new_versions: Optional[Dict[str, Any]] = None) -> RunnableConfig:
         """Save a checkpoint and flush pending writes."""
-        # First, flush any existing pending writes
-        self.flush_pending_writes(config, checkpoint["id"])
         thread_id = config["configurable"]["thread_id"]
         checkpoint_id = checkpoint["id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
@@ -383,7 +404,7 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
             "checkpoint_ns": checkpoint_ns,
             "version": "1.0",
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "step": 0  # Initialize step to 0
+            "step": checkpoint.get("step", 0)  # Get step from checkpoint
         }
 
         # Add parent_checkpoint_id if available
@@ -400,6 +421,21 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
         # Update step from metadata if present
         if metadata and "step" in metadata:
             minio_metadata["step"] = metadata["step"]
+            checkpoint["step"] = metadata["step"]
+
+        # Ensure checkpoint has required fields
+        if "v" not in checkpoint:
+            checkpoint["v"] = 1
+        if "ts" not in checkpoint:
+            checkpoint["ts"] = datetime.now(UTC).isoformat()
+        if "channel_values" not in checkpoint:
+            checkpoint["channel_values"] = {}
+        if "channel_versions" not in checkpoint:
+            checkpoint["channel_versions"] = {}
+        if "versions_seen" not in checkpoint:
+            checkpoint["versions_seen"] = {}
+        if "pending_sends" not in checkpoint:
+            checkpoint["pending_sends"] = []
 
         # Store checkpoint
         key = self._get_checkpoint_key(thread_id, checkpoint_ns, checkpoint_id)
@@ -411,15 +447,20 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
             "checkpoint": checkpoint,
             "metadata": {
                 **(metadata or {}),
-                "step": minio_metadata["step"]  # Ensure step is included in metadata
+                "step": minio_metadata["step"]
             }
         }
     
-        self.store.put_object(
-            key=key,
-            data=json.dumps(checkpoint_data).encode('utf-8'),
-            metadata=minio_metadata
-        )
+        try:
+            self.store.put_object(
+                key=key,
+                data=json.dumps(checkpoint_data).encode('utf-8'),
+                metadata=minio_metadata
+            )
+            logger.debug(f"Saved checkpoint {checkpoint_id} to {key}")
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint {checkpoint_id}: {e}")
+            raise
 
         # Store new versions if provided
         if new_versions:
@@ -429,11 +470,15 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
                     "type": "json",
                     "value": version
                 }
-                self.store.put_object(
-                    key=version_path,
-                    data=json.dumps(version_data).encode('utf-8'),
-                    metadata=minio_metadata
-                )
+                try:
+                    self.store.put_object(
+                        key=version_path,
+                        data=json.dumps(version_data).encode('utf-8'),
+                        metadata=minio_metadata
+                    )
+                    logger.debug(f"Saved version {version} for channel {channel}")
+                except Exception as e:
+                    logger.error(f"Failed to save version {version} for channel {channel}: {e}")
 
         return config
 
@@ -459,7 +504,13 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
         if result is None:
             return None
 
-        data, metadata = result
+        # Handle different return value structures
+        if isinstance(result, tuple):
+            data, metadata = result
+        else:
+            data = result
+            metadata = {}
+
         if data is None:
             return None
 
@@ -494,61 +545,67 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
             return None
 
     def get_latest(self, thread_id: str) -> Optional[Checkpoint]:
-        """Get the latest checkpoint for a thread."""
-        # Use _get_key to construct the prefix, but without the checkpoint_id
+        """Get the latest checkpoint for a thread.
+    
+        Args:
+            thread_id: The thread ID to get the latest checkpoint for
+            
+        Returns:
+            The latest checkpoint, or None if no checkpoints exist
+            
+        Raises:
+            RuntimeError: If there's an error accessing the MinIO store
+            ValueError: If the thread_id is invalid
+        """
+        if not thread_id:
+            raise ValueError("thread_id cannot be empty")
+        
         prefix = self._get_key(thread_id, "", "")
         
         try:
-            # List all objects with the prefix
             objects = self.store.list_objects(prefix)
-            
-            if not objects:
-                return None
-            
-            # Find the latest version
-            latest_key = None
-            latest_timestamp = None
-            for obj in objects:
-                if obj.endswith("checkpoint.json"):
-                    try:
-                        # Get the checkpoint data
-                        data = self.store.get_object(obj)
-                        if data is None:
-                            continue
-                            
-                        # Parse the checkpoint
-                        checkpoint_data = json.loads(data.decode('utf-8'))
-                        checkpoint = checkpoint_data["checkpoint"]
-                        timestamp = datetime.fromisoformat(checkpoint["ts"])
-                        
-                        # Update latest if this is newer
-                        if latest_timestamp is None or timestamp > latest_timestamp:
-                            latest_timestamp = timestamp
-                            latest_key = obj
-                    except (json.JSONDecodeError, KeyError, ValueError) as e:
-                        logger.error(f"Error parsing checkpoint {obj}: {e}")
-                        continue
-            
-            if latest_key is None:
-                return None
-            
-            # Load the latest checkpoint
+        except Exception as e:
+            raise RuntimeError(f"Failed to list objects in MinIO store: {str(e)}") from e
+        print(objects)
+        if not objects:
+            return None
+        
+        latest_key = None
+        latest_timestamp = None
+        
+        for obj in objects:
+            if not obj.endswith("checkpoint.json"):
+                continue
+                
+            try:
+                data = self.store.get_object(obj)
+                if data is None:
+                    continue
+                    
+                checkpoint_data = json.loads(data.decode('utf-8'))
+                checkpoint = checkpoint_data["checkpoint"]
+                timestamp = datetime.fromisoformat(checkpoint["ts"])
+                
+                if latest_timestamp is None or timestamp > latest_timestamp:
+                    latest_timestamp = timestamp
+                    latest_key = obj
+            except (json.JSONDecodeError, KeyError, ValueError) as e:
+                logger.warning(f"Skipping malformed checkpoint {obj}: {str(e)}")
+                continue
+        if latest_key is None:
+            return None
+        try:
             data = self.store.get_object(latest_key)
             if data is None:
-                logger.debug(f"Failed to load checkpoint from key={latest_key}")
+                logger.debug(f"Checkpoint disappeared: {latest_key}")
                 return None
-            
+                
             checkpoint_data = json.loads(data.decode('utf-8'))
             checkpoint = checkpoint_data["checkpoint"]
-
-            # Ensure checkpoint has a step key
-            if "step" not in checkpoint:
-                checkpoint["step"] = 0
-
+            checkpoint.setdefault("step", 0)
             return checkpoint
         except Exception as e:
-            logger.error(f"Error getting latest checkpoint: {e}")
-            return None
+            raise RuntimeError(f"Failed to load checkpoint {latest_key}: {str(e)}") from e
     
 
     def list_versions(self, thread_id: str, checkpoint_id: str) -> List[str]:
@@ -870,17 +927,7 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
         task_id: str = "",
         task_path: Optional[str] = None,
     ) -> List[PendingWrite]:
-        """Load pending writes for a checkpoint.
-
-        Args:
-            thread_id: ID of the thread
-            checkpoint_id: ID of the checkpoint
-            task_id: Optional ID of the task (defaults to empty string)
-            task_path: Optional path of the task
-
-        Returns:
-            List of PendingWrite objects
-        """
+        """Load pending writes for a checkpoint with caching."""
         if not checkpoint_id:
             logger.warning("No checkpoint_id provided, returning empty list")
             return []
@@ -903,42 +950,44 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
                 
             # Sort objects by path to maintain order
             sorted_objects = sorted(objects)
-            logger.debug(f"Found {len(sorted_objects)} pending writes")
+            logger.debug(f"Found {len(sorted_objects)} pending write objects")
             
             pending_writes = []
             for obj in sorted_objects:
-                logger.debug(f"Loading write from {obj}")
-                # Get the pending write data
+                logger.debug(f"Loading writes from {obj}")
+                # Get the pending write data (using cached version if available)
                 data = self.store.get_object(obj)
                 if data is None:
                     continue
                     
                 try:
-                    serialized_data = json.loads(data.decode('utf-8'))
-                    value_type = serialized_data.get("type")
-                    value = serialized_data.get("value")
+                    # Parse the batched writes
+                    batched_writes = json.loads(data.decode('utf-8'))
                     
-                    # Deserialize based on type
-                    if value_type in ("int", "float", "bool", "str"):
-                        deserialized_value = eval(f"{value_type}({repr(value)})")
-                    elif value_type in ("dict", "list"):
-                        deserialized_value = value
-                    else:
-                        deserialized_value = value  # Keep as string for complex types
+                    for channel, write_data in batched_writes.items():
+                        value_type = write_data.get("type")
+                        value = write_data.get("value")
                         
-                    # Extract channel from key
-                    channel = obj.split("/")[-1]  # Last component is the channel
-                    
-                    pending_writes.append(
-                        (
-                            task_id,
-                            channel,
-                            deserialized_value
+                        # Deserialize based on type
+                        if value_type in ("int", "float", "bool", "str"):
+                            deserialized_value = eval(f"{value_type}({repr(value)})")
+                        elif value_type == "json":
+                            deserialized_value = value
+                        elif value_type == "pickle":
+                            deserialized_value = pickle.loads(bytes.fromhex(value))
+                        else:
+                            deserialized_value = value  # Keep as string for unknown types
+                            
+                        pending_writes.append(
+                            (
+                                task_id,
+                                channel,
+                                deserialized_value
+                            )
                         )
-                    )
-                    logger.debug(f"Loaded write for channel {channel} with type {value_type}")
+                        logger.debug(f"Loaded write for channel {channel} with type {value_type}")
                 except Exception as e:
-                    logger.error(f"Failed to deserialize write from {obj}: {e}")
+                    logger.error(f"Failed to deserialize writes from {obj}: {e}")
                     continue
                 
             return pending_writes
@@ -954,14 +1003,7 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
         task_id: str,
         task_path: Optional[str] = None,
     ) -> None:
-        """Save pending writes to MinIO.
-
-        Args:
-            config: The runnable config containing thread_id and checkpoint_id
-            writes: Sequence of (channel, value) tuples to save
-            task_id: ID of the task these writes belong to
-            task_path: Optional path of the task
-        """        
+        """Save pending writes to MinIO with optimized batching."""
         # Get checkpoint_id from configurable
         checkpoint_id = config["configurable"].get("checkpoint_id")
         if not checkpoint_id:
@@ -972,38 +1014,66 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
         thread_id = config["configurable"]["thread_id"]
         checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
         
+        # Group writes by channel to minimize duplicates
+        channel_writes = {}
+        for channel, value in writes:
+            if channel not in channel_writes:
+                channel_writes[channel] = value
+            else:
+                # If channel already exists, keep the latest value
+                channel_writes[channel] = value
+
+        # Prepare metadata once
         metadata = {
             "thread_id": thread_id,
             "checkpoint_id": checkpoint_id,
             "checkpoint_ns": checkpoint_ns,
             "created_at": str(datetime.now().timestamp()),
+            "task_id": task_id,
+            "task_path": task_path or "",
+            "write_count": str(len(channel_writes))
         }
 
-        for channel, value in writes:
-            key = self._get_checkpoint_write_key(
-                thread_id=thread_id,
-                checkpoint_id=checkpoint_id,
-                task_id=task_id,
-                task_path=task_path,
-                channel=channel,
+        # Batch all writes into a single object with optimized serialization
+        batched_writes = {}
+        for channel, value in channel_writes.items():
+            # Optimize serialization based on value type
+            if isinstance(value, (str, int, float, bool)):
+                batched_writes[channel] = {
+                    "type": type(value).__name__,
+                    "value": value
+                }
+            elif isinstance(value, (dict, list)):
+                batched_writes[channel] = {
+                    "type": "json",
+                    "value": value
+                }
+            else:
+                # For complex types, use pickle for better serialization
+                batched_writes[channel] = {
+                    "type": "pickle",
+                    "value": pickle.dumps(value).hex()
+                }
+
+        # Store all writes in a single object with optimized key
+        key = self._get_checkpoint_write_key(
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id,
+            task_id=task_id,
+            task_path=task_path,
+            channel="",  # Empty channel to store all writes
+        )
+        
+        try:
+            # Use the store's put_object which includes buffering
+            self.store.put_object(
+                key=key,
+                data=json.dumps(batched_writes).encode(),
+                metadata=metadata
             )
-            
-            # Serialize value with type information
-            value_type = type(value).__name__
-            serialized_data = {
-                "type": value_type,
-                "value": value if isinstance(value, (str, int, float, bool, dict, list)) else str(value)
-            }
-            
-            try:
-                self.store.put_object(
-                    key=key,
-                    data=json.dumps(serialized_data).encode(),
-                    metadata=metadata
-                )
-                logger.debug(f"Saved write to {key} with type {value_type}")
-            except Exception as e:
-                logger.error(f"Failed to save write to {key}: {e}")
+            logger.debug(f"Buffered {len(channel_writes)} writes to {key}")
+        except Exception as e:
+            logger.error(f"Failed to buffer writes to {key}: {e}")
 
     def get_next_version(
         self,
@@ -1072,70 +1142,10 @@ class BaseMinioSaver(BaseCheckpointSaver, Generic[StoreType]):
         checkpoint_id: str,
         force: bool = False,
     ) -> None:
-        """Flush pending writes to Minio, ensuring they are persisted.
+        """Flush pending writes to Minio with optimized batching."""
+        # First, flush the write buffer to ensure all writes are persisted
+        if hasattr(self.store, '_flush_buffer'):
+            self.store._flush_buffer()
         
-        Args:
-            config: RunnableConfig containing thread_id and checkpoint_ns.
-            checkpoint_id: The checkpoint ID to flush writes for.
-            force: If True, flush even if no checkpoint exists yet.
-        """
-        thread_id = config["configurable"]["thread_id"]
-        checkpoint_ns = config["configurable"].get("checkpoint_ns", "")
-
-        # Load pending writes
-        pending_writes = self._load_pending_writes(thread_id, checkpoint_id, "", "")
-        if not pending_writes and not force:
-            return  # Nothing to flush
-
-        # Get or create a minimal checkpoint (if forcing a flush)
-        checkpoint = self.get(config)
-        if checkpoint is None and force:
-            checkpoint = {
-                "v": 1,
-                "id": checkpoint_id,
-                "ts": datetime.now(UTC).isoformat(),
-                "channel_values": {},
-                "channel_versions": {},
-                "versions_seen": {},
-                "pending_sends": [],
-            }
-
-        if checkpoint is None:
-            raise ValueError("Checkpoint not found and force=False")
-
-        # Process each pending write
-        new_versions = {}
-        for write in pending_writes:
-            channel = write[1] # Use task_id as channel name
-            next_version = self.get_next_version(
-                current=checkpoint["channel_versions"].get(channel),
-                channel=channel,
-            )
-            new_versions[channel] = next_version
-
-            # Store the write as a channel value
-            key = self._get_checkpoint_blob_key(thread_id, checkpoint_ns, channel, next_version)
-            version_data = {
-                "type": "json",
-                "value": write[2],
-            }
-            self.store.put_object(
-                key=key,
-                data=json.dumps(version_data).encode("utf-8"),
-                metadata={
-                    "thread_id": thread_id,
-                    "checkpoint_id": checkpoint_id,
-                    "checkpoint_ns": checkpoint_ns,
-                    "version": "1.0",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                },
-            )
-
-        # Update checkpoint with new versions (if any)
-        if new_versions:
-            checkpoint["channel_versions"].update(new_versions)
-            # Re-save the checkpoint with updated versions
-            self.put(config, checkpoint)
-
-        # Clear pending writes (only if we successfully processed them)
-        self._clear_pending_writes(thread_id, checkpoint_ns, checkpoint_id)
+        # Then proceed with the normal flush operation
+        super().flush_pending_writes(config, checkpoint_id, force)

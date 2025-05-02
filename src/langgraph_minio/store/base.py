@@ -1,10 +1,12 @@
 import json
 from datetime import datetime, timezone
-from typing import Dict, Any, Optional, List, TYPE_CHECKING, Union, Literal, Iterable, Iterator, Tuple, AsyncIterator, Sequence
+from typing import Dict, Any, Optional, List, TYPE_CHECKING, Union, Literal, Iterable, Tuple
 from minio import Minio
-from minio.error import S3Error
 import logging
 import io
+import threading
+import time
+from collections import defaultdict
 from langgraph.store.base import (
     SearchItem,
     GetOp,
@@ -18,13 +20,136 @@ from langgraph.store.base import (
 )
 import aiohttp
 from datetime import timedelta
-import pickle
+from minio.error import S3Error
+
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+class WriteBuffer:
+    """A thread-safe buffer for write operations."""
+    
+    def __init__(self, client: Minio, bucket_name: str, max_size: int = 1000, flush_interval: float = 1.0):
+        self.client = client
+        self.bucket_name = bucket_name
+        self.max_size = max_size
+        self.flush_interval = flush_interval
+        self.buffer = defaultdict(list)
+        self.lock = threading.Lock()
+        self.last_flush = time.time()
+        self.flush_thread = threading.Thread(target=self._flush_loop, daemon=True)
+        self.flush_thread.start()
+    
+    def add(self, key: str, data: bytes, metadata: Dict[str, str]) -> None:
+        """Add a write operation to the buffer."""
+        with self.lock:
+            self.buffer[key].append((data, metadata))
+            if len(self.buffer) >= self.max_size:
+                self._flush()
+    
+    def _flush(self) -> None:
+        """Flush the buffer to storage."""
+        with self.lock:
+            if not self.buffer:
+                return
+            
+            # Group writes by key
+            grouped_writes = {}
+            for key, writes in self.buffer.items():
+                if not writes:
+                    continue
+                
+                # Take the latest write for each key
+                data, metadata = writes[-1]
+                grouped_writes[key] = (data, metadata)
+            
+            self.buffer.clear()
+            self.last_flush = time.time()
+            
+            # Write to MinIO
+            for key, (data, metadata) in grouped_writes.items():
+                try:
+                    # Convert metadata to MinIO format
+                    metadata_str = {}
+                    if metadata:
+                        for k, v in metadata.items():
+                            if not k.lower().startswith('x-amz-meta-'):
+                                metadata_str[f'x-amz-meta-{k}'] = str(v)
+                            else:
+                                metadata_str[k] = str(v)
+                    
+                    # Write to MinIO
+                    self.client.put_object(
+                        bucket_name=self.bucket_name,
+                        object_name=key,
+                        data=io.BytesIO(data),
+                        length=len(data),
+                        metadata=metadata_str
+                    )
+                    logger.debug(f"Flushed write for key {key}")
+                except Exception as e:
+                    logger.error(f"Failed to flush write for key {key}: {e}")
+    
+    def _flush_loop(self) -> None:
+        """Background thread that periodically flushes the buffer."""
+        while True:
+            time.sleep(self.flush_interval)
+            self._flush()
+
+class Cache:
+    """A thread-safe cache for frequently accessed data."""
+    
+    def __init__(self, max_size: int = 100000, ttl: float = 5.0):
+        self.max_size = max_size
+        self.ttl = ttl
+        self.cache = {}
+        self.timestamps = {}
+        self.lock = threading.Lock()
+        self.cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self.cleanup_thread.start()
+    
+    def get(self, key: str) -> Optional[bytes]:
+        """Get a value from the cache."""
+        with self.lock:
+            if key not in self.cache:
+                return None
+            
+            # Check if item has expired
+            if time.time() - self.timestamps[key] > self.ttl:
+                del self.cache[key]
+                del self.timestamps[key]
+                return None
+            
+            return self.cache[key]
+    
+    def put(self, key: str, value: bytes) -> None:
+        """Put a value in the cache."""
+        with self.lock:
+            # Remove oldest item if cache is full
+            if len(self.cache) >= self.max_size:
+                oldest_key = min(self.timestamps.items(), key=lambda x: x[1])[0]
+                del self.cache[oldest_key]
+                del self.timestamps[oldest_key]
+            
+            self.cache[key] = value
+            self.timestamps[key] = time.time()
+    
+    def _cleanup_loop(self) -> None:
+        """Background thread that periodically cleans up expired items."""
+        while True:
+            time.sleep(self.ttl)
+            with self.lock:
+                current_time = time.time()
+                expired_keys = [
+                    key for key, timestamp in self.timestamps.items()
+                    if current_time - timestamp > self.ttl
+                ]
+                for key in expired_keys:
+                    del self.cache[key]
+                    del self.timestamps[key]
+
 class MinioStore:
-    """A store that uses MinIO as the backend storage."""
+    """A high-performance MinIO store with caching and write buffering."""
 
     def __init__(
         self,
@@ -33,6 +158,10 @@ class MinioStore:
         secret_key: Optional[str] = None,
         bucket_name: str = None,
         client: Optional[Minio] = None,
+        cache_size: int = 100000,
+        cache_ttl: float = 5.0,
+        buffer_size: int = 1000,
+        buffer_interval: float = 1.0,
     ):
         """Initialize the store.
         
@@ -42,18 +171,49 @@ class MinioStore:
             secret_key: The MinIO secret key
             bucket_name: The name of the bucket to use
             client: An existing MinIO client to use
+            cache_size: Maximum number of items to cache (default: 100000)
+            cache_ttl: Time-to-live for cached items in seconds (default: 5.0)
+            buffer_size: Maximum number of writes to buffer (default: 1000)
+            buffer_interval: Interval between buffer flushes in seconds (default: 1.0)
         """
-        if not client and not (endpoint_url and access_key and secret_key):
-            raise ValueError("Either client or endpoint_url, access_key, and secret_key must be provided")
-        
-        self.client = client or Minio(
-            endpoint_url.replace("http://", "").replace("https://", ""),
-            access_key=access_key,
-            secret_key=secret_key,
-            secure=False
-        )
-        self.bucket_name = bucket_name or "default"
-        self._ensure_bucket_exists()
+        if not bucket_name:
+            raise ValueError("bucket_name is required")
+            
+        try:
+            if client:
+                self.client = client
+            else:
+                if not endpoint_url:
+                    raise ValueError("endpoint_url is required")
+                if not access_key:
+                    raise ValueError("access_key is required") 
+                if not secret_key:
+                    raise ValueError("secret_key is required")
+                    
+                self.client = Minio(
+                    endpoint_url.replace("http://", "").replace("https://", ""),
+                    access_key=access_key,
+                    secret_key=secret_key,
+                    secure=False,
+                    http_client=None  # Let MinIO handle HTTP client creation
+                )
+                
+            self.bucket_name = bucket_name
+            
+            # Test connection by checking bucket exists
+            self.client.bucket_exists(self.bucket_name)
+            
+            # Initialize cache and write buffer
+            self.cache = Cache(max_size=cache_size, ttl=cache_ttl)
+            self.write_buffer = WriteBuffer(
+                client=self.client,
+                bucket_name=self.bucket_name,
+                max_size=buffer_size,
+                flush_interval=buffer_interval
+            )
+            
+        except Exception as e:
+            raise RuntimeError(f"Failed to initialize MinIO client: {str(e)}")
 
     def _ensure_bucket_exists(self) -> None:
         """Ensure the bucket exists, creating it if necessary."""
@@ -72,62 +232,73 @@ class MinioStore:
             raise RuntimeError(f"Failed to access bucket {self.bucket_name}: {e}")
 
     def list_objects(self, prefix: str = "") -> List[str]:
-        """List objects in the store with a prefix.
+        """List objects in the store with a prefix and caching."""
+        # Use a cache key for the list operation
+        cache_key = f"list:{prefix}"
         
-        Args:
-            prefix: The prefix to filter objects by
-            
-        Returns:
-            List of object keys
-        """
+        # Try cache first
+        cached_result = self.cache.get(cache_key)
+        if cached_result is not None:
+            return json.loads(cached_result.decode())
+        
+        # If not in cache, get from MinIO
         try:
-            objects = list(self.client.list_objects(self.bucket_name, prefix, True))
-            return [obj.object_name for obj in objects]
+            objects = []
+            for obj in self.client.list_objects(self.bucket_name, prefix, True):
+                objects.append(obj.object_name)
+            
+            # Cache the result with a short TTL (5 seconds) to prevent excessive calls
+            self.cache.put(cache_key, json.dumps(objects).encode())
+            
+            return objects
         except Exception as e:
-            logger.error(f"Failed to list objects: {e}")
+            logger.error(f"Failed to list objects with prefix {prefix}: {e}")
             raise RuntimeError(f"Failed to list objects in bucket {self.bucket_name}: {e}")
 
     def get_object(self, key: str, include_metadata: bool = False, refresh_ttl: bool = False) -> Union[Optional[bytes], Optional[Tuple[bytes, Dict[str, str]]]]:
-        """Get an object from MinIO.
+        """Get an object from MinIO with caching."""
+        # Try cache first
+        cached_data = self.cache.get(key)
+        if cached_data is not None:
+            if include_metadata:
+                # Get metadata from MinIO
+                try:
+                    metadata = {}
+                    response = self.client.stat_object(self.bucket_name, key)
+                    for key, value in response.metadata.items():
+                        if key.startswith('x-amz-meta-'):
+                            metadata[key[11:]] = value
+                    return (cached_data, metadata)
+                except Exception as e:
+                    logger.warning(f"Failed to get metadata: {e}")
+                    return (cached_data, {})
+            return cached_data
 
-        Args:
-            key: The key of the object.
-            include_metadata: Whether to include metadata in the response.
-            refresh_ttl: Whether to refresh the TTL if it exists.
-
-        Returns:
-            If include_metadata is False, returns the object data as bytes or None if not found.
-            If include_metadata is True, returns a tuple of (data, metadata) or None if not found.
-
-        Raises:
-            RuntimeError: If the object cannot be retrieved.
-        """
+        # If not in cache, get from MinIO
         try:
-            # Get object and metadata
-            try:
-                response = self.client.get_object(self.bucket_name, key)
-            except S3Error as e:
-                if e.code == 'NoSuchKey':
-                    return None
-                raise
-
-            # Extract metadata from headers
-            metadata = {}
-            for header_key, value in response.headers.items():
-                if header_key.lower().startswith('x-amz-meta-'):
-                    clean_key = header_key.lower()[11:]  # Remove 'x-amz-meta-' prefix
-                    metadata[clean_key] = value
-
-            # Read data
+            response = self.client.get_object(self.bucket_name, key)
             data = response.read()
             response.close()
+            response.release_conn()
+
+            # Cache the data
+            self.cache.put(key, data)
 
             if include_metadata:
+                metadata = {}
+                try:
+                    response = self.client.stat_object(self.bucket_name, key)
+                    for key, value in response.metadata.items():
+                        if key.startswith('x-amz-meta-'):
+                            metadata[key[11:]] = value
+                except Exception as e:
+                    logger.warning(f"Failed to get metadata: {e}")
                 return (data, metadata)
+
             return data
         except Exception as e:
             logger.error(f"Failed to get object {key}: {e}")
-            raise
+            return None
 
     def put_object(self, key: str, data: bytes, metadata: Optional[Dict[str, str]] = None) -> None:
         """Put an object in the store."""
@@ -141,172 +312,110 @@ class MinioStore:
                     else:
                         metadata_str[k] = str(v)
             
-            # Handle TTL if present in metadata
-            if metadata and "ttl" in metadata:
-                ttl = float(metadata["ttl"])
-                if ttl > 0:
-                    # Set expiration time
-                    expiration = datetime.now(timezone.utc) + timedelta(seconds=ttl)
-                    metadata_str["x-amz-meta-expiration"] = expiration.isoformat()
-                    metadata_str["x-amz-meta-last_accessed"] = datetime.now(timezone.utc).isoformat()
-            
-            # Wrap data in BytesIO for MinIO client
-            if isinstance(data, str):
-                data_io = io.BytesIO(data.encode('utf-8'))
-            else:
-                data_io = io.BytesIO(data)
-            
+            # Put object
             self.client.put_object(
                 bucket_name=self.bucket_name,
                 object_name=key,
-                data=data_io,
+                data=io.BytesIO(data),
                 length=len(data),
                 metadata=metadata_str
             )
+            
+            # Cache the data
+            self.cache.put(key, data)
+            
         except Exception as e:
-            logger.error(f"Error putting object {key}: {e}")
-            raise
+            logger.error(f"Failed to put object {key}: {e}")
+            raise RuntimeError(f"Failed to put object in bucket {self.bucket_name}: {e}")
 
     def delete_object(self, key: str) -> None:
-        """Delete an object from the store.
+        """Delete an object from the store."""
+        # Remove from cache
+        self.cache.put(key, None)  # Using None as a sentinel value
         
-        Args:
-            key: Object key
-        """
+        # Delete from MinIO
         try:
             self.client.remove_object(self.bucket_name, key)
         except Exception as e:
             logger.error(f"Failed to delete object: {e}")
             raise
 
-    def put(
-        self,
-        namespace: Tuple[str, ...],
-        key: str,
-        value: Dict[str, Any],
-        index: Optional[Union[Literal[False], List[str]]] = None,
-        *,
-        ttl: Union[Optional[float], NotProvided] = NOT_PROVIDED
-    ) -> None:
-        """Store or update an item in the store.
+    def put(self, namespace, key, data, ttl=None):
+        """Put an object in the store."""
+        self._ensure_bucket_exists()
+        object_key = self._get_object_key(namespace, key)
+        metadata_key = f"{object_key}.metadata"
 
-        Args:
-            namespace: Hierarchical path for the item, represented as a tuple of strings.
-                Example: ("documents", "user123")
-            key: Unique identifier within the namespace. Together with namespace forms
-                the complete path to the item.
-            value: Dictionary containing the item's data. Must contain string keys and
-                JSON-serializable values.
-            index: Controls how the item's fields are indexed for search:
-                None (default): Use fields configured when creating store (if any)
-                False: Disable indexing for this item
-                list[str]: List of field paths to index, supporting:
-                    - Nested fields: "metadata.title"
-                    - Array access: "chapters[*].content"
-                    - Specific indices: "authors[0].name"
-            ttl: Time to live in seconds. If specified, item will expire after this many
-                seconds from the last access time.
-        """
+        # Create metadata with ISO format timestamps
+        metadata = {
+            'created_at': datetime.now(timezone.utc).isoformat(),
+            'updated_at': datetime.now(timezone.utc).isoformat(),
+            'namespace': namespace,
+            'key': key
+        }
+        
+        if ttl is not None:
+            metadata.update({
+                'ttl': str(ttl * 60),  # Convert minutes to seconds
+                'last_accessed': str(time.time())  # Use Unix timestamp for easier comparison
+            })
+
+        # Put the object
         try:
-            # Construct the full key from namespace and key
-            full_key = "/".join(namespace + (key,))
-
-            # Convert value to JSON and encode as bytes
-            data = json.dumps(value).encode('utf-8')
-
-            # Store the data
-            self.put_object(full_key, data)
-
-            # Store metadata
-            metadata_key = f"{full_key}.metadata"
-            now = datetime.now(timezone.utc).isoformat()
-            metadata = {
-                'created_at': now,
-                'updated_at': now
-            }
-            
-            # Add TTL if provided (convert to seconds)
-            if ttl is not NOT_PROVIDED and ttl is not None:
-                metadata.update({
-                    'ttl': str(ttl),  # Store TTL in seconds
-                    'last_accessed': now
-                })
-
-            metadata_data = json.dumps(metadata).encode('utf-8')
-            self.put_object(metadata_key, metadata_data)
-
-            # Handle indexing if needed
-            if index is not False:
-                # Store index information
-                index_key = f"{full_key}.index"
-                index_data = {
-                    "fields": index or [],
-                    "timestamp": now
-                }
-                index_bytes = json.dumps(index_data).encode('utf-8')
-                self.put_object(index_key, index_bytes)
-
+            data_bytes = json.dumps(data).encode('utf-8')
+            self.client.put_object(
+                self.bucket_name,
+                object_key,
+                io.BytesIO(data_bytes),
+                len(data_bytes)
+            )
+            self._put_metadata(metadata_key, metadata)
         except Exception as e:
-            logger.error(f"Failed to put item: {e}")
+            logger.warning(f"Failed to put object {object_key}: {str(e)}")
             raise
 
-    def get(
-        self,
-        namespace: Tuple[str, ...],
-        key: str,
-        *,
-        refresh_ttl: Optional[bool] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Get an item from the store.
+    def get(self, namespace, key, refresh_ttl=False):
+        """Get an object from the store."""
+        self._ensure_bucket_exists()
+        object_key = self._get_object_key(namespace, key)
+        metadata_key = self._get_metadata_key(object_key)
 
-        Args:
-            namespace: Hierarchical path for the item
-            key: Unique identifier within the namespace
-            refresh_ttl: If True and item has TTL, update last access time
-
-        Returns:
-            The item's data as a dictionary, or None if not found
-        """
         try:
-            # Construct full key from namespace and key
-            full_key = "/".join(namespace + (key,))
-            metadata_key = f"{full_key}.metadata"
-
             # Get metadata first to check TTL
-            metadata_bytes = self.get_object(metadata_key)
-            if metadata_bytes is None:
-                return None
+            metadata = self._get_metadata(metadata_key)
+            if metadata and 'ttl' in metadata:
+                last_accessed = time.time()
+                if 'last_accessed' in metadata:
+                    try:
+                        last_accessed = float(metadata['last_accessed'])
+                    except ValueError:
+                        # Handle ISO format timestamp
+                        dt = datetime.fromisoformat(metadata['last_accessed'])
+                        last_accessed = dt.timestamp()
 
-            metadata = json.loads(metadata_bytes.decode('utf-8'))
-            
-            # Check TTL expiration
-            if 'ttl' in metadata and metadata['ttl'] is not None:
-                ttl_seconds = float(metadata['ttl'])  # TTL is stored in seconds
-                last_accessed = datetime.fromisoformat(metadata['last_accessed'])
-                now = datetime.now(timezone.utc)
-                
-                # If TTL has expired, delete the item and return None
-                if (now - last_accessed).total_seconds() > ttl_seconds:
-                    logger.debug(f"Object {full_key} has expired (TTL: {ttl_seconds} seconds, Last accessed: {last_accessed})")
+                ttl = float(metadata['ttl'])
+                if time.time() - last_accessed > ttl:
+                    # TTL expired, delete object and metadata
                     self.delete(namespace, key)
                     return None
 
-                # Update last_accessed if refresh_ttl is True
-                if refresh_ttl:
-                    metadata['last_accessed'] = now.isoformat()
-                    metadata_data = json.dumps(metadata).encode('utf-8')
-                    self.put_object(metadata_key, metadata_data)
-                    logger.debug(f"Refreshed TTL for object {full_key} (new last_accessed: {now.isoformat()})")
+            # Get the actual object
+            response = self.client.get_object(self.bucket_name, object_key)
+            data = json.loads(response.read().decode('utf-8'))
 
-            # Get the actual data with TTL refresh
-            data_bytes = self.get_object(full_key, refresh_ttl=refresh_ttl)
-            if data_bytes is None:
+            # Refresh TTL if requested and TTL exists
+            if refresh_ttl and metadata and 'ttl' in metadata:
+                metadata['last_accessed'] = str(time.time())  # Store as Unix timestamp
+                self._put_metadata(metadata_key, metadata)
+
+            return data
+        except S3Error as e:
+            if e.code == 'NoSuchKey':
                 return None
-
-            return json.loads(data_bytes.decode('utf-8'))
-        except Exception as e:
-            logger.error(f"Failed to get item: {e}")
             raise
+        except Exception as e:
+            logger.error(f"Failed to get object {object_key}: {str(e)}")
+            return None
 
     def _match_filter(self, item: Dict[str, Any], filter: Dict[str, Any]) -> bool:
         """Match an item against a filter.
@@ -357,123 +466,68 @@ class MinioStore:
                     return False
                 
         return True
-
-    def search(
-        self,
-        namespace_prefix: Tuple[str, ...],
-        /,
-        *,
-        query: Optional[str] = None,
-        filter: Optional[Dict[str, Any]] = None,
-        limit: int = 10,
-        offset: int = 0,
-        refresh_ttl: Optional[bool] = None,
-    ) -> List[SearchItem]:
-        """Search for items within a namespace prefix.
-
-        Args:
-            namespace_prefix: Hierarchical path prefix to search within.
-            query: Optional query for natural language search.
-            filter: Key-value pairs to filter results.
-            limit: Maximum number of items to return.
-            offset: Number of items to skip before returning results.
-            refresh_ttl: Whether to refresh TTLs for the returned items.
-                If no TTL is specified, this argument is ignored.
-
-        Returns:
-            List of items matching the search criteria.
-        """
+    def search(self, namespace_prefix, query=None, filter=None, limit=None, offset=None):
+        """Search for objects in the store."""
+        self._ensure_bucket_exists()
+        prefix = self._get_object_key(namespace_prefix, "")
+        
         try:
-            # Construct prefix for listing objects
-            prefix = "/".join(namespace_prefix) if namespace_prefix else ""
-            
-            # List all objects in namespace
-            objects = self.list_objects(prefix)
-            if not objects:
-                return []
-            
+            objects = self.client.list_objects(self.bucket_name, prefix=prefix, recursive=True)
             results = []
-            for obj_key in objects:
-                # Skip metadata and index files
-                if obj_key.endswith(('.metadata', '.index')):
-                    continue
-                    
-                # Get and parse the item
-                data = self.get_object(obj_key)
-                if data is None:
+            
+            for obj in objects:
+                if obj.object_name.endswith('.metadata'):
                     continue
                     
                 try:
-                    # Try to deserialize as pickle first
-                    item = pickle.loads(data)
-                except Exception:
-                    try:
-                        # Fall back to JSON if pickle fails
-                        item = json.loads(data.decode('utf-8'))
-                    except Exception as e:
-                        logger.warning(f"Failed to deserialize data for {obj_key}: {e}")
-                        continue
-                
-                # Apply filters if specified
-                if filter and not self._match_filter(item, filter):
+                    # Get object data
+                    response = self.client.get_object(self.bucket_name, obj.object_name)
+                    data = json.loads(response.read().decode('utf-8'))
+                    response.close()
+                    response.release_conn()
+                    
+                    # Get metadata
+                    metadata_key = self._get_metadata_key(obj.object_name)
+                    metadata = self._get_metadata(metadata_key) or {}
+                    
+                    # Apply filter if provided
+                    if filter:
+                        if not self._match_filter(data, filter):
+                            continue
+                    
+                    # Create search result
+                    namespace_parts = obj.object_name.split('/')
+                    key = namespace_parts[-1]
+                    namespace = tuple(namespace_parts[:-1])
+                    
+                    # Convert timestamps to ISO format if needed
+                    created_at = metadata.get('created_at', datetime.now(timezone.utc).isoformat())
+                    updated_at = metadata.get('updated_at', datetime.now(timezone.utc).isoformat())
+                    
+                    result = SearchItem(
+                        namespace=namespace,
+                        key=key,
+                        value=data,
+                        created_at=created_at,
+                        updated_at=updated_at
+                    )
+                    results.append(result)
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to process object {obj.object_name}: {str(e)}")
                     continue
-                
-                # Get metadata for timestamps
-                metadata_key = f"{obj_key}.metadata"
-                metadata_data = self.get_object(metadata_key)
-                
-                created_at = datetime.now().isoformat()
-                updated_at = created_at
-                
-                if metadata_data is not None:
-                    try:
-                        metadata = json.loads(metadata_data.decode('utf-8'))
-                        created_at = metadata.get('created_at', created_at)
-                        updated_at = metadata.get('updated_at', updated_at)
-                    except Exception as e:
-                        logger.warning(f"Failed to parse metadata for {obj_key}: {e}")
-                
-                # Add to results
-                results.append(SearchItem(
-                    key=obj_key.split('/')[-1],
-                    value=item,
-                    namespace=namespace_prefix,
-                    created_at=created_at,
-                    updated_at=updated_at,
-                    score=1.0  # Basic implementation without real scoring
-                ))
             
-            # Handle pagination
-            if not results:
-                return []
+            # Apply pagination
+            if offset:
+                results = results[offset:]
+            if limit:
+                results = results[:limit]
                 
-            # Handle None values for offset and limit
-            offset = offset if offset is not None else 0
-            limit = limit if limit is not None else len(results)
+            return results
             
-            start = min(offset, len(results))
-            end = min(offset + limit, len(results))
-            paginated_results = results[start:end]
-            
-            # Refresh TTLs if needed
-            if refresh_ttl and paginated_results:
-                for result in paginated_results:
-                    metadata_key = f"{prefix}/{result.key}.metadata"
-                    metadata_data = self.get_object(metadata_key)
-                    if metadata_data is not None:
-                        try:
-                            metadata = json.loads(metadata_data.decode('utf-8'))
-                            if 'ttl' in metadata:
-                                metadata['last_accessed'] = datetime.now().isoformat()
-                                self.put_object(metadata_key, json.dumps(metadata).encode('utf-8'))
-                        except Exception as e:
-                            logger.warning(f"Failed to refresh TTL for {metadata_key}: {e}")
-            
-            return paginated_results
-
         except Exception as e:
-            logger.error(f"Failed to search items: {e}")
-            raise
+            logger.warning(f"Failed to search objects with prefix {prefix}: {str(e)}")
+            return []
 
     def delete(self, namespace: Tuple[str, ...], key: str) -> None:
         """Delete an item.
@@ -499,6 +553,7 @@ class MinioStore:
         except Exception as e:
             logger.error(f"Failed to delete item: {e}")
             raise
+
     def list_namespaces(
         self,
         *,
@@ -508,101 +563,54 @@ class MinioStore:
         limit: int = 100,
         offset: int = 0
     ) -> List[Tuple[str, ...]]:
-        """List and filter namespaces in the store.
-
-        Used to explore the organization of data, find specific collections, or navigate 
-        the namespace hierarchy.
-
-        Args:
-            prefix: Filter namespaces that start with this path.
-            suffix: Filter namespaces that end with this path.
-            max_depth: Return namespaces up to this depth in the hierarchy.
-                      Namespaces deeper than this level will be truncated.
-            limit: Maximum number of namespaces to return (default 100).
-            offset: Number of namespaces to skip for pagination (default 0).
-
-        Returns:
-            List[Tuple[str, ...]]: A list of namespace tuples that match the criteria.
-            Each tuple represents a full namespace path up to max_depth.
-        """
+        """List namespaces in the store."""
         try:
-            # Get prefix string for listing objects
+            # Convert prefix and suffix to strings for MinIO
             prefix_str = "/".join(prefix) + "/" if prefix else ""
+            suffix_str = "/".join(suffix) if suffix else ""
             
-            # List all objects
-            objects = self.list_objects(prefix_str)
+            # Get all objects with the prefix
+            objects = []
+            for obj in self.client.list_objects(self.bucket_name, prefix_str, True):
+                if suffix_str and not obj.object_name.endswith(suffix_str):
+                    continue
+                objects.append(obj.object_name)
             
-            # Extract unique namespaces
+            # Extract namespaces from object names
             namespaces = set()
-            for obj_key in objects:
-                # Skip metadata and index files
-                if obj_key.endswith(('.metadata', '.index')):
+            for obj_name in objects:
+                parts = obj_name.split("/")
+                if max_depth is not None and len(parts) > max_depth:
                     continue
-                
-                # Split path into components
-                parts = tuple(obj_key.split('/')[:-1])  # Exclude the key
-                if not parts:  # Skip if no namespace parts
-                    continue
-                
-                # Apply max_depth if specified
-                if max_depth is not None:
-                    parts = parts[:max_depth]
-                
-                # Apply suffix filter if specified
-                if suffix:
-                    if len(parts) < len(suffix):
-                        continue
-                    if parts[-len(suffix):] != suffix:
-                        continue
-                
-                namespaces.add(parts)
+                namespace = tuple(parts[:-1])  # Remove the key part
+                if namespace:
+                    namespaces.add(namespace)
             
-            # Convert to sorted list and apply pagination
-            sorted_namespaces = sorted(list(namespaces))
+            # Apply limit and offset
+            namespaces = sorted(namespaces)
+            return namespaces[offset:offset + limit]
             
-            # Handle empty results
-            if not sorted_namespaces:
-                return []
-                
-            # Handle offset
-            if offset:
-                if offset >= len(sorted_namespaces):
-                    return []
-                
-                end_idx = min(offset + limit, len(sorted_namespaces))   
-                return sorted_namespaces[offset:end_idx]
-            else:
-                return sorted_namespaces
-
         except Exception as e:
             logger.error(f"Failed to list namespaces: {e}")
-            raise
+            raise RuntimeError(f"Failed to list namespaces in bucket {self.bucket_name}: {e}")
 
     def batch(self, ops: Iterable[Op]) -> List[Result]:
-        """Execute multiple operations synchronously in a single batch.
-
-        Args:
-            ops: An iterable of operations to execute.
-
-        Returns:
-            A list of results, where each result corresponds to an operation in the input.
-            The order of results matches the order of input operations.
-        """
+        """Execute multiple operations synchronously in a single batch."""
         results = []
         for op in ops:
             if isinstance(op, GetOp):
                 result = self.get(op.namespace, op.key, refresh_ttl=op.refresh_ttl)
             elif isinstance(op, PutOp):
-                self.put(op.namespace, op.key, op.value, op.index, ttl=op.ttl)
+                self.put(op.namespace, op.key, op.value, ttl=op.ttl)
                 result = None
+            # DeleteOp is not supported in langgraph.store.base
             elif isinstance(op, SearchOp):
                 result = self.search(
                     op.namespace_prefix,
                     query=op.query,
                     filter=op.filter,
                     limit=op.limit,
-                    offset=op.offset,
-                    refresh_ttl=op.refresh_ttl
+                    offset=op.offset
                 )
             elif isinstance(op, ListNamespacesOp):
                 result = self.list_namespaces(
@@ -676,4 +684,40 @@ class MinioStore:
         except Exception as e:
             logger.error(f"Failed to put object: {e}")
             raise
+
+    def _get_object_key(self, namespace, key):
+        """Get the full object key from namespace and key."""
+        namespace_str = "/".join(namespace) if namespace else ""
+        return f"{namespace_str}/{key}" if namespace_str else key
+
+    def _get_metadata_key(self, object_key):
+        """Get the metadata key for an object."""
+        return f"{object_key}.metadata"
+
+    def _put_metadata(self, metadata_key, metadata):
+        """Put metadata for an object."""
+        try:
+            metadata_bytes = json.dumps(metadata).encode('utf-8')
+            self.client.put_object(
+                self.bucket_name,
+                metadata_key,
+                io.BytesIO(metadata_bytes),
+                len(metadata_bytes)
+            )
+        except Exception as e:
+            logger.warning(f"Failed to put metadata {metadata_key}: {str(e)}")
+            raise
+
+    def _get_metadata(self, metadata_key):
+        """Get metadata for an object."""
+        try:
+            response = self.client.get_object(self.bucket_name, metadata_key)
+            return json.loads(response.read().decode('utf-8'))
+        except S3Error as e:
+            if e.code == 'NoSuchKey':
+                return None
+            raise
+        except Exception as e:
+            logger.warning(f"Failed to get metadata {metadata_key}: {str(e)}")
+            return None
 

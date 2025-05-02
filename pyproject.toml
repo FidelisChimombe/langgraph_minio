@@ -27,7 +27,7 @@ readme = "README.md"
 packages = [{include = "langgraph_minio", from = "src"}]
 
 [tool.poetry.dependencies]
-python = ">=3.13,<4.0"
+python = ">=3.10,<4.0"
 langgraph = ">=0.0.19"
 
 [tool.poetry.group.dev.dependencies]

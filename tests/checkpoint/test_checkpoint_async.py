@@ -92,7 +92,7 @@ async def test_async_get_latest(async_checkpointer, sample_checkpoint):
     
     # Put a checkpoint first
     config = {"configurable": {"thread_id": thread_id}}
-    await async_checkpointer.aput(config, sample_checkpoint, {})
+    await async_checkpointer.aput(config, sample_checkpoint)
     
     # Get the latest checkpoint
     latest = await async_checkpointer.aget_latest(thread_id)
@@ -141,4 +141,53 @@ async def test_async_error_handling_get_version(async_checkpointer):
 
     # Test invalid version
     result = await async_checkpointer.aget_version(config, "test-channel", "invalid-version")
-    assert result is None 
+    assert result is None
+
+@pytest.mark.asyncio
+async def test_async_checkpointer_initialization():
+    """Test async checkpointer initialization."""
+    # Create store and checkpointer
+    store = AsyncMinioStore(
+        endpoint_url="http://localhost:9000",
+        access_key="minioadmin",
+        secret_key="minioadmin",
+        bucket_name="test-bucket"
+    )
+    checkpointer = AsyncMinioSaver(store)
+    
+    assert checkpointer.store == store
+    assert checkpointer.prefix == "checkpoints"
+    
+    # Test with context manager
+    async with AsyncMinioStore(
+        endpoint_url="http://localhost:9000",
+        access_key="minioadmin",
+        secret_key="minioadmin",
+        bucket_name="test-bucket"
+    ) as store:
+        checkpointer = AsyncMinioSaver(store)
+        assert checkpointer.store == store
+        assert checkpointer.prefix == "checkpoints"
+
+@pytest.mark.asyncio
+async def test_async_checkpointer_error_handling():
+    """Test error handling for async checkpointer operations."""
+    # Test with invalid store
+    with pytest.raises(ValueError):
+        AsyncMinioSaver(None)
+    
+    # Test with invalid bucket
+    store = AsyncMinioStore(
+        endpoint_url="http://localhost:9000",
+        access_key="minioadmin",
+        secret_key="minioadmin",
+        bucket_name="invalid-bucket"
+    )
+    checkpointer = AsyncMinioSaver(store)
+    
+    # Need to await _ensure_bucket_exists() first
+    await store._ensure_bucket_exists()
+    
+    # Should return None when no checkpoints exist
+    result = await checkpointer.aget_latest("test-thread")
+    assert result is None
